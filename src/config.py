@@ -6,7 +6,7 @@ import json
 import hashlib
 
 
-DataConstruction = Literal["prod"]  # per author/book: 21d compounding
+DataConstruction = Literal["prod"]  # 21d compounding
 TickerType = Literal["price", "rate"]
 
 
@@ -22,7 +22,7 @@ class Config:
 
     # --- Paths ---
     dictionary_path: str = "data/input/dictionary.xlsx"
-    returns_path: str = "data/input/returns.csv"  # daily returns input for now
+    returns_path: str = "data/input/returns.csv"  # daily returns input
 
     artifacts_root: str = "data/artifacts"
     models_root: str = "models"
@@ -44,7 +44,7 @@ class Config:
     forward_months: int = 3
     memory_halflife_years: float = 10.0
 
-    # --- Clipping (optional stage) ---
+    # --- Clipping (optional, to be continued) ---
     is_clipping: bool = False
     clip_assets: Optional[float] = None  # e.g. 0.20 for +/- 20%
     clip_rates: Optional[float] = None   # e.g. 0.01 (100 bps) in rate units
@@ -73,3 +73,4 @@ class Config:
         """
         payload = self.to_json().encode("utf-8")
         return hashlib.sha256(payload).hexdigest()[:10]
+
