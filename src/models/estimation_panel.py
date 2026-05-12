@@ -1,147 +1,160 @@
+"""
+LNLM panel estimation.
+
+Reference: Barrau & Douady (2022) ch. 4 section 4.3.
+
+For each rebalancing date and each (target, feature) pair, fit one LNLM on a
+rolling window of `window_days` daily observations ending at the rebalancing
+date. Pairs with fewer than `min_obs_per_model` valid joint observations in
+the window are skipped.
+
+Parallelization via joblib.Parallel has each worker handle one feature across
+all dates and targets. Joblib's default loky backend uses cloudpickle and works
+in Jupyter notebooks on Windows out of the box, unlike raw multiprocessing.Pool.
+"""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
-import numpy as np
 import pandas as pd
+from joblib import Parallel, delayed
 
-from .lnlm_fit import fit_lnlm_single_factor, LnlmFitResult
-
-
-@dataclass(frozen=True)
-class EstimationParams:
-    """
-    Parameters for monthly LNLM panel estimation.
-    """
-    window_months: int = 60
-    min_window_months: int = 30
-    degree_n: int = 4
-    n_folds: int = 5
-    n_mu_points: int = 100
-    random_state: Optional[int] = None
-
-def _select_window_indices(index: pd.DatetimeIndex, end_pos: int, window_months: int) -> slice:
-    """
-    Return slice selecting the last `window_months` observations ending at end_pos (inclusive).
-    """
-    start_pos = max(0, end_pos - window_months + 1)
-    return slice(start_pos, end_pos + 1)
+from .lnlm_fit import LnlmFitResult, fit_lnlm_single_factor
+from ..features.alignment import align_XY
 
 
-def run_lnlm_panel_estimation(
-    Y_monthly: pd.DataFrame,
-    X_lagged_monthly: pd.DataFrame,
-    params: EstimationParams,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Run LNLM estimation panel, monthly frequency.
-
-    For each month-end t:
-      - use a rolling window of (up to) `window_months` observations ending at t
-      - if available obs < min_window_months => skip
-      - fit one LNLM per (market, factor) using x=X_lagged[:, factor] and y=Y[:, market]
-      - compute in-sample rmse and r2
-      - store mu and coefficients for refit/audit
-
-    Returns
-    -------
-    rmse_long, params_long
-    """
-    if not isinstance(Y_monthly.index, pd.DatetimeIndex) or not isinstance(X_lagged_monthly.index, pd.DatetimeIndex):
-        raise TypeError("Y_monthly and X_lagged_monthly must have DatetimeIndex.")
-
-    # Align on common index
-    common = Y_monthly.index.intersection(X_lagged_monthly.index)
-    Y = Y_monthly.loc[common].copy()
-    X = X_lagged_monthly.loc[common].copy()
-
-    dates = list(common)
-    markets = list(Y.columns)
-    factors = list(X.columns)
-
+def _process_feature_for_panel(
+    feature_name: str,
+    x_series: pd.Series,
+    Y: pd.DataFrame,
+    rebalancing_dates: pd.DatetimeIndex,
+    window_days: int,
+    min_obs: int,
+    degree_n: int,
+    n_folds: int,
+    n_mu_points: int,
+    random_state: int,
+) -> Tuple[List[dict], List[dict]]:
+    """Worker: fit LNLM for one feature across all (date, target). Module-level for joblib."""
+    common = x_series.index
+    targets = list(Y.columns)
     rmse_rows: List[dict] = []
     param_rows: List[dict] = []
 
-    for i, t in enumerate(dates):
-        # Determine how many observations are available up to i (inclusive)
-        n_avail = i + 1
-        if n_avail < params.min_window_months:
+    for t in rebalancing_dates:
+        if t not in common:
             continue
+        end_pos = common.get_loc(t)
+        start_pos = max(0, end_pos - window_days + 1)
+        x_win = x_series.iloc[start_pos : end_pos + 1]
+        Y_win = Y.iloc[start_pos : end_pos + 1]
 
-        win_len = min(params.window_months, n_avail)
-        sl = _select_window_indices(common, i, win_len)
-
-        Y_win = Y.iloc[sl]
-        X_win = X.iloc[sl]
-
-        # For each market/factor pair, fit on the overlapping finite points
-        for m in markets:
-            y_series = Y_win[m].astype(float)
-
-            for f in factors:
-                x_series = X_win[f].astype(float)
-
-                y_arr = y_series.to_numpy(dtype=float)
-                x_arr = x_series.to_numpy(dtype=float)
-                mask = np.isfinite(y_arr) & np.isfinite(x_arr)
-
-                n_obs = int(mask.sum())
-                if n_obs < params.min_obs_per_model:
-                    continue
-
-                x = x_arr[mask]
-                y = y_arr[mask]
-
-                try:
-                    fit: LnlmFitResult = fit_lnlm_single_factor(
-                        x=x,
-                        y=y,
-                        degree_n=params.degree_n,
-                        n_folds=params.n_folds,
-                        n_mu_points=params.n_mu_points,
-                        random_state=params.random_state,
-                    )
-                except Exception:
-                    # If a single fit fails (rare), skip it rather than crashing the full panel
-                    continue
-
-                rmse_rows.append(
-                    {
-                        "date": t,
-                        "market": str(m),
-                        "factor": str(f),
-                        "rmse": fit.rmse,
-                        "r2": fit.r2,
-                        "n_obs": fit.n_obs,
-                    }
+        for tgt in targets:
+            pair = pd.concat([x_win, Y_win[tgt]], axis=1, keys=["x", "y"]).dropna()
+            if len(pair) < min_obs:
+                continue
+            try:
+                fit: LnlmFitResult = fit_lnlm_single_factor(
+                    x=pair["x"].to_numpy(),
+                    y=pair["y"].to_numpy(),
+                    degree_n=degree_n,
+                    n_folds=n_folds,
+                    n_mu_points=n_mu_points,
+                    random_state=random_state,
                 )
+            except Exception as e:
+                print(f"Fit failed for {tgt} / {feature_name} at {t}: {type(e).__name__} - {e}")
+                continue
 
-                # Expand nonlinear coeffs into separate columns for Parquet friendliness
-                row = {
-                    "date": t,
-                    "market": str(m),
-                    "factor": str(f),
-                    "mu": fit.mu,
-                    "y_mean": fit.y_mean,
-                    "linear_coef": fit.linear_coef,
-                    "degree_n": fit.degree_n,
-                    "n_folds": fit.n_folds,
-                    "n_obs": fit.n_obs,
-                }
-                for j, c in enumerate(fit.nonlinear_coef):
-                    row[f"nonlinear_coef_{j}"] = float(c)
-                param_rows.append(row)
+            rmse_rows.append({
+                "date": t,
+                "target": str(tgt),
+                "feature": str(feature_name),
+                "rmse": fit.rmse,
+                "r2": fit.r2,
+                "n_obs": fit.n_obs,
+            })
+            row = {
+                "date": t,
+                "target": str(tgt),
+                "feature": str(feature_name),
+                "mu": fit.mu,
+                "y_mean": fit.y_mean,
+                "linear_coef": fit.linear_coef,
+                "degree_n": fit.degree_n,
+                "n_folds": fit.n_folds,
+                "n_obs": fit.n_obs,
+            }
+            for j, c in enumerate(fit.nonlinear_coef):
+                row[f"nonlinear_coef_{j}"] = float(c)
+            param_rows.append(row)
+
+    return rmse_rows, param_rows
+
+
+def fit_lnlm_panel(
+    Y: pd.DataFrame,
+    X: pd.DataFrame,
+    rebalancing_dates: pd.DatetimeIndex,
+    config: Dict[str, Any],
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Fit one LNLM per (target, feature, rebalancing_date) triple.
+
+    Parameters
+    ----------
+    Y : DataFrame of target time series, indexed by daily dates.
+    X : DataFrame of feature time series, indexed by daily dates, already
+        lagged by `config["lag_days"]` if applicable.
+    rebalancing_dates : the dates at which to refit the panel.
+    config : configuration dict produced by `default_config()`. Read keys:
+        window_days, min_obs_per_model, degree_n, n_folds, n_mu_points,
+        random_state, n_workers, joblib_verbose.
+
+    Returns
+    -------
+    rmse_long : long DataFrame with columns date, target, feature, rmse, r2, n_obs.
+    params_long : long DataFrame with fit parameters (mu, coefs, etc.).
+    """
+    Y, X = align_XY(Y, X)
+    features = list(X.columns)
+
+    window_days = config["window_days"]
+    min_obs = config["min_obs_per_model"]
+    degree_n = config["degree_n"]
+    n_folds = config["n_folds"]
+    n_mu_points = config["n_mu_points"]
+    random_state = config["random_state"]
+    n_workers = config.get("n_workers", -1)
+    joblib_verbose = config.get("joblib_verbose", 5)
+
+    if n_workers in (1, None):
+        results = [
+            _process_feature_for_panel(
+                feat, X[feat], Y, rebalancing_dates,
+                window_days, min_obs, degree_n, n_folds, n_mu_points, random_state,
+            )
+            for feat in features
+        ]
+    else:
+        results = Parallel(n_jobs=n_workers, verbose=joblib_verbose)(
+            delayed(_process_feature_for_panel)(
+                feat, X[feat], Y, rebalancing_dates,
+                window_days, min_obs, degree_n, n_folds, n_mu_points, random_state,
+            )
+            for feat in features
+        )
+
+    rmse_rows = [r for rmse, _ in results for r in rmse]
+    param_rows = [r for _, params in results for r in params]
 
     rmse_long = pd.DataFrame(rmse_rows)
     params_long = pd.DataFrame(param_rows)
-
     if not rmse_long.empty:
         rmse_long["date"] = pd.to_datetime(rmse_long["date"])
-        rmse_long = rmse_long.sort_values(["date", "market", "factor"]).reset_index(drop=True)
-
+        rmse_long = rmse_long.sort_values(["date", "target", "feature"]).reset_index(drop=True)
     if not params_long.empty:
         params_long["date"] = pd.to_datetime(params_long["date"])
-        params_long = params_long.sort_values(["date", "market", "factor"]).reset_index(drop=True)
-
+        params_long = params_long.sort_values(["date", "target", "feature"]).reset_index(drop=True)
     return rmse_long, params_long
