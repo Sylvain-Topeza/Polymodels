@@ -1,0 +1,29 @@
+{
+  "artifacts_root": "data/artifacts",
+  "clip_abs_max": null,
+  "degree_n": 4,
+  "features": null,
+  "forward_months": 3,
+  "joblib_verbose": 5,
+  "kde_bandwidth": null,
+  "kde_grid_size": 400,
+  "keep_top_quantile": 0.8,
+  "lag_days": 21,
+  "leverage_risk_off": 0.5,
+  "leverage_risk_on": 2.0,
+  "memory_halflife_years": 10.0,
+  "metric": "rmse",
+  "min_obs_per_model": 252,
+  "min_samples": 10,
+  "n_folds": 5,
+  "n_mu_points": 100,
+  "n_workers": -1,
+  "random_state": 42,
+  "results_root": "results",
+  "rolling_min_periods": 18,
+  "rolling_window_days": 21,
+  "targets": [
+    "SPX Index"
+  ],
+  "window_days": 1260
+}
