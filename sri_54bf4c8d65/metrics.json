@@ -1,0 +1,11 @@
+{
+  "SPX Index": {
+    "annualized_return": 0.09186623183311271,
+    "annualized_volatility": 0.28507740486874733,
+    "cagr": 0.051696090274856,
+    "calmar": 0.07254092291224985,
+    "final_equity": 3.06566743526453,
+    "max_drawdown": -0.7126472644605156,
+    "sharpe": 0.30835028627719374
+  }
+}
