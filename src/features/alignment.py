@@ -1,97 +1,65 @@
+"""
+Build and align target/feature panels.
+
+Reference: Barrau & Douady (2022) ch. 4 §4.2.
+
+Naming follows the author's review: `targets` for the variables we want to
+explain (Y) and `features` for the explanatory variables (X). The user may
+keep targets in the feature set or not, both are supported.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 import pandas as pd
 
 
 @dataclass(frozen=True)
 class XYSpec:
-    """
-    Specification for building X/Y monthly matrices.
-    """
-    markets: Sequence[str]
-    factors: Optional[Sequence[str]] = None  # if None => all columns excluding markets
-    lag_months: int = 1  # X_{t-lag} predicts Y_t
+    """Specification for splitting a wide features DataFrame into Y and X."""
+    targets: Sequence[str]
+    features: Optional[Sequence[str]] = None  # if None, use all non-target columns
 
 
-def build_XY_monthly(features_monthly: pd.DataFrame, spec: XYSpec) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Build Y (markets) and X (factors) from a monthly feature dataframe.
+def build_XY(features_df: pd.DataFrame, spec: XYSpec) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Split a feature DataFrame into Y (targets) and X (features)."""
+    if not isinstance(features_df.index, pd.DatetimeIndex):
+        raise TypeError("features_df must have a DatetimeIndex.")
 
-    Parameters
-    ----------
-    features_monthly:
-        DataFrame indexed by month-end dates, columns=tickers
-    spec:
-        markets: list of market tickers (targets)
-        factors: list of factor tickers (predictors). If None, use all non-market tickers.
+    cols = list(map(str, features_df.columns))
+    targets = [str(t) for t in spec.targets]
 
-    Returns
-    -------
-    Y, X:
-        Y: DataFrame (T x M) for markets
-        X: DataFrame (T x K) for factors
-    """
-    if not isinstance(features_monthly.index, pd.DatetimeIndex):
-        raise TypeError("features_monthly must have a DatetimeIndex.")
+    missing_targets = [t for t in targets if t not in cols]
+    if missing_targets:
+        raise KeyError(f"Missing target tickers in features_df: {missing_targets}")
 
-    cols = list(map(str, features_monthly.columns))
-    markets = [str(m) for m in spec.markets]
-
-    missing_markets = [m for m in markets if m not in cols]
-    if missing_markets:
-        raise KeyError(f"Missing market tickers in features_monthly: {missing_markets}")
-
-    if spec.factors is None:
-        factors = [c for c in cols if c not in set(markets)]
+    if spec.features is None:
+        feats = [c for c in cols if c not in set(targets)]
     else:
-        factors = [str(f) for f in spec.factors]
-        missing_factors = [f for f in factors if f not in cols]
-        if missing_factors:
-            raise KeyError(f"Missing factor tickers in features_monthly: {missing_factors}")
+        feats = [str(f) for f in spec.features]
+        missing_feats = [f for f in feats if f not in cols]
+        if missing_feats:
+            raise KeyError(f"Missing feature tickers in features_df: {missing_feats}")
 
-    Y = features_monthly.loc[:, markets].copy()
-    X = features_monthly.loc[:, factors].copy()
+    Y = features_df.loc[:, targets].copy()
+    X = features_df.loc[:, feats].copy()
     return Y, X
 
 
-def apply_monthly_lag(X: pd.DataFrame, lag_months: int) -> pd.DataFrame:
+def align_XY(Y: pd.DataFrame, X: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Shift X by lag_months so that X_lagged[t] corresponds to original X[t-lag].
-
-    For the book's setup (lag=1 month): X_{t-1} -> Y_t
+    Align Y and X on their common index and drop rows where X is fully NaN
+    (typically the first `lag_days` rows after a shift).
+    Per-pair NaN handling is left to the estimation step.
     """
-    if lag_months < 0:
-        raise ValueError("lag_months must be >= 0")
-    if lag_months == 0:
-        return X.copy()
-    return X.shift(lag_months)
-
-
-def align_XY_after_lag(Y: pd.DataFrame, X_lagged: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Align Y and X_lagged on common monthly index and drop rows where X_lagged is fully NaN.
-    (We do NOT drop rows for partial NaNs here; estimation will handle per factor.)
-    """
-    common = Y.index.intersection(X_lagged.index)
+    common = Y.index.intersection(X.index)
     Yc = Y.loc[common].copy()
-    Xc = X_lagged.loc[common].copy()
+    Xc = X.loc[common].copy()
 
-    # Remove rows where all predictors are NaN (common at the beginning due to lag)
     all_nan = Xc.isna().all(axis=1)
     if all_nan.any():
         Yc = Yc.loc[~all_nan]
         Xc = Xc.loc[~all_nan]
-
     return Yc, Xc
-
-
-def month_end_validate(df: pd.DataFrame) -> None:
-    """
-    Lightweight check: index is month-end-ish and monotonic increasing.
-    """
-    if not df.index.is_monotonic_increasing:
-        raise ValueError("Monthly dataframe index must be sorted ascending.")
-    # No strict assertion on exact month-end because 'ME' resample can yield calendar month end.
